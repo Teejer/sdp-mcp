@@ -1,0 +1,20 @@
+[project]
+name = "sdp-mcp"
+version = "0.1.0"
+description = "Local MCP server for ManageEngine ServiceDesk Plus Cloud (Private Site) API v3"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2,<3",
+    "httpx2>=2.5.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+sdp-mcp = "sdp_mcp:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["sdp_mcp"]

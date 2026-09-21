@@ -1,0 +1,13 @@
+# Secrets — never commit these
+.env
+.env.*
+!.env.example
+refresh_token.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.egg-info/
