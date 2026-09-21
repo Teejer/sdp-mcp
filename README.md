@@ -11,6 +11,9 @@ update, assign, pickup, close, note, trash/restore — plus lookup tools for
 technicians, groups, priorities, statuses, templates, request types and
 requesters.
 
+> **New here?** Follow the step-by-step [HOWTO guide](HOWTO.md) — including how
+> to create the API credentials at <https://api-console.zoho.com/>.
+
 ## 1. Get credentials (Zoho OAuth Self Client)
 
 Your site is SDP Cloud On-Demand, so the v3 API authenticates with **Zoho
