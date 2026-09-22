@@ -72,3 +72,30 @@ Add this to the MCP server instructions so every session sees it without setup:
 - A `list_closure_codes` (or confirm none exist and remove the parameter).
 - When an SDP call fails, return the raw `response_status` block — the agent can do a lot with
   `{status_code: 3000, messages: [...]}` and nothing at all with `Error executing tool`.
+
+## Resolution notes (fixed 2026-09-22)
+
+All items above are addressed. Corrections to a few findings from the triage session:
+
+- **Closure codes DO exist on this site** — 7 active request codes: Success, Cancelled, Failed,
+  Moved, Postponed, Rejected, Unable to Reproduce (`GET /closure_codes`, exposed as
+  `list_closure_codes`). Closed tickets show `closure_code: null` because the codes are optional,
+  not absent. `close_request` still defaults to no code.
+- **There is no "In Progress" status.** Site statuses: Canceled, Closed, On Hold, Open, Resolved.
+  `update_request` now resolves status strings/names to a status **id** automatically — this site
+  rejects a status PUT by `{"name": ...}` and accepts only `{"id": ...}`.
+- **The close blocker has two parts:** a missing resolution (hard requirement) AND a
+  "No work log found" warning. A close with a resolution but no worklog returns
+  `{status_code: 3000, fields: ["No work log found"]}` and the ticket STAYS OPEN. Log a worklog
+  (or accept the warning surfacing) before closing.
+- `requester_ack_resolution` now defaults **false** — true sends the requester a
+  resolution-confirmation email on every close.
+- New recommended close path: `resolve_request(request_id, resolution, close=true)` after an
+  optional `add_worklog`. `close_request` alone raises a clear error pointing there when the
+  resolution is missing.
+- Warnings are surfaced: list-style responses get a `_warnings` key; failed/non-JSON responses
+  raise the parsed `response_status` instead of a generic exception.
+- `list_statuses`/`list_technicians`/`get_request_conversation` are now working (row_count must be
+  inside `input_data.list_info`; statuses response key is `statuses`).
+- `get_request(get_notes=true)` fetches notes in a second call (the `get_notes` query param is
+  rejected). `delete_request(permanent=true)` uses PUT `is_removed` (`delete_type` param rejected).
