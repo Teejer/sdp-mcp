@@ -478,7 +478,9 @@ def close_request(
 
 
 def _parse_time_spent(spec: str) -> tuple[str, str]:
-    """Accept '1:30', '1.5', '90m', '1h30m', '0:15' -> (hours, minutes)."""
+    """Accept '1:30', '1.5', '90m', '1h30m', '0:15' -> (hours, minutes).
+    Passed through as-is; your SDP instance records arbitrary durations
+    (live worklogs include 0:01, 0:05, 0:10, 2:30...)."""
     spec = spec.strip().lower().replace("h", ":").replace("m", ":")
     parts = [p for p in spec.replace(".", ":").split(":") if p != ""]
     if len(parts) == 1:
@@ -558,6 +560,9 @@ def delete_note(request_id: str, note_id: str) -> str:
     return json.dumps(data, indent=2)
 
 
+_LARGE_WORKLOG_HOURS = 10
+
+
 @mcp.tool()
 def add_worklog(
     request_id: str,
@@ -567,13 +572,34 @@ def add_worklog(
     owner_id: str = "",
     start_time_ms: str = "",
     end_time_ms: str = "",
+    confirm_large_hours: bool = False,
 ) -> str:
     """Log work on a ticket. time_spent like '1:30' (1 hr 30 min) or '30m'.
     work_done is the 'work performed' text appended to the description.
     owner_id is the technician's SDP id (defaults to the technician this
     server authenticates as — see list_technicians). start/end default to
-    now. Note: this SDP instance rejects status/is_billable keys."""
+    now. Note: this SDP instance rejects status/is_billable keys.
+    Durations over 10 hours are refused unless confirm_large_hours=true —
+    ask the user first, then retry with it set if they really meant it."""
     hours, minutes = _parse_time_spent(time_spent)
+    total_minutes = int(hours) * 60 + int(minutes)
+    if total_minutes > _LARGE_WORKLOG_HOURS * 60 and not confirm_large_hours:
+        return json.dumps(
+            {
+                "confirmation_required": True,
+                "message": (
+                    f"That's {hours}h {minutes}m of work — over "
+                    f"{_LARGE_WORKLOG_HOURS} hours. Show this to the user and "
+                    "ask: 'You're logging "
+                    f"{hours}h {minutes}m on ticket "
+                    f"{request_id}. Confirm?' Only retry with "
+                    "confirm_large_hours=true if they say yes."
+                ),
+                "request_id": request_id,
+                "time_spent": f"{hours}:{minutes.zfill(2)}",
+            },
+            indent=2,
+        )
     desc = description or work_done
     if work_done and description:
         desc = f"{description}\n\nWork done: {work_done}"
