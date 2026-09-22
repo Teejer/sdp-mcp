@@ -47,15 +47,71 @@ ACCOUNTS_SERVER = os.getenv("SDP_ACCOUNTS_SERVER", "https://accounts.zoho.com").
 API_PREFIX = "/api/v3"
 ACCEPT_HEADER = "application/vnd.manageengine.sdp.v3+json"
 
-# Cached OAuth access token (module-level, refreshed near expiry)
+# Cached OAuth access token. Persisted to a small file next to .env so the
+# token survives container restarts and we never call the refresh endpoint
+# more than about once an hour. Rapid re-refresh of a Zoho refresh token is
+# treated as token theft and revokes the whole token chain, so this cache is
+# a safety feature, not just an optimization.
+_TOKEN_CACHE_PATH = os.environ.get(
+    "SDP_TOKEN_CACHE",
+    # Home dir, not the module dir: the container runs as a non-root user that
+    # can't write to /app. Override to share the cache across containers.
+    os.path.join(os.path.expanduser("~"), ".sdp_token_cache.json"),
+)
+_MIN_REFRESH_INTERVAL = 3000  # hard floor: at most one refresh per 50 minutes
 _oauth: dict[str, Any] = {"access_token": "", "expires_at": 0.0}
 
 
+def _load_token_cache() -> None:
+    try:
+        with open(_TOKEN_CACHE_PATH) as fh:
+            data = json.load(fh)
+        if (
+            data.get("refresh_token") == REFRESH_TOKEN
+            and data.get("access_token")
+            and float(data.get("expires_at", 0)) > time.time() + 60
+        ):
+            _oauth["access_token"] = data["access_token"]
+            _oauth["expires_at"] = float(data["expires_at"])
+    except (OSError, ValueError, TypeError):
+        pass  # no cache / corrupt / different token — start fresh
+
+
+def _save_token_cache() -> None:
+    try:
+        with open(_TOKEN_CACHE_PATH, "w") as fh:
+            json.dump(
+                {
+                    "access_token": _oauth["access_token"],
+                    "expires_at": _oauth["expires_at"],
+                    "refresh_token": REFRESH_TOKEN,
+                },
+                fh,
+            )
+        os.chmod(_TOKEN_CACHE_PATH, 0o600)
+    except OSError:
+        pass  # read-only fs — in-memory cache still works for this process
+
+
 def _oauth_access_token() -> str:
-    """Return a valid Zoho OAuth access token, refreshing via the stored
-    refresh token when missing or within 60s of expiry."""
+    """Return a valid Zoho OAuth access token. Uses the in-memory cache, then
+    the on-disk cache, and only calls the refresh endpoint if both are
+    exhausted — at most once per _MIN_REFRESH_INTERVAL."""
     if _oauth["access_token"] and time.time() < _oauth["expires_at"] - 60:
         return _oauth["access_token"]
+    if not _oauth["access_token"]:
+        _load_token_cache()
+        if _oauth["access_token"] and time.time() < _oauth["expires_at"] - 60:
+            return _oauth["access_token"]
+    next_ok = _oauth.get("last_refresh_attempt", 0) + _MIN_REFRESH_INTERVAL
+    if time.time() < next_ok:
+        raise RuntimeError(
+            "OAuth access token expired and a refresh was attempted less than "
+            f"{_MIN_REFRESH_INTERVAL // 60} minutes ago. Refusing to refresh "
+            "again: rapid refresh calls revoke the Zoho refresh token. "
+            "Retry later or re-run: python sdp_mcp.py exchange <code>"
+        )
+    _oauth["last_refresh_attempt"] = time.time()
     resp = httpx2.post(
         f"{ACCOUNTS_SERVER}/oauth/v2/token",
         params={
@@ -71,6 +127,7 @@ def _oauth_access_token() -> str:
         raise RuntimeError(f"OAuth refresh failed: {json.dumps(data)}")
     _oauth["access_token"] = data["access_token"]
     _oauth["expires_at"] = time.time() + float(data.get("expires_in", 3600))
+    _save_token_cache()
     return _oauth["access_token"]
 
 
@@ -133,9 +190,12 @@ def _request(
     *,
     params: Optional[dict[str, Any]] = None,
     input_data: Optional[dict[str, Any]] = None,
+    form: bool = False,
 ) -> dict[str, Any]:
-    """Call the SDP v3 API. Mutations send input_data as a form field;
-    GET list operations send it as a query parameter."""
+    """Call the SDP v3 API. GET list operations send input_data as a query
+    parameter; mutations send it as a form field (form=True). The worklogs
+    endpoint in particular mis-parses nested objects like `owner` when
+    input_data arrives in the query string."""
     _require_config()
     url = f"{BASE_URL}{API_PREFIX}{path}"
     headers = {
@@ -143,14 +203,19 @@ def _request(
         **_auth_header(),
     }
     query = dict(params or {})
+    body = None
     if input_data is not None:
-        query["input_data"] = json.dumps(input_data)
+        if form or method.upper() in ("POST", "PUT"):
+            body = {"input_data": json.dumps(input_data)}
+        else:
+            query["input_data"] = json.dumps(input_data)
 
     resp = httpx2.request(
         method,
         url,
         headers=headers,
         params=query if query else None,
+        data=body,
         timeout=30.0,
     )
     if resp.status_code >= 400:
@@ -350,7 +415,7 @@ def create_request(
         request["site"] = {"name": site}
     if cc_emails:
         request["email_ids_to_notify"] = cc_emails
-    data = _request("POST", "/requests", input_data={"request": request})
+    data = _request("POST", "/requests", input_data={"request": request}, form=True)
     return json.dumps(data, indent=2)
 
 
@@ -364,7 +429,7 @@ def update_request(request_id: str, fields_json: str) -> str:
     fields = json.loads(fields_json)
     if not isinstance(fields, dict):
         raise ValueError("fields_json must be a JSON object")
-    data = _request("PUT", f"/requests/{request_id}", input_data={"request": fields})
+    data = _request("PUT", f"/requests/{request_id}", input_data={"request": fields}, form=True)
     return json.dumps(data, indent=2)
 
 
@@ -374,7 +439,7 @@ def assign_request(request_id: str, technician: str, group: str = "") -> str:
     input_data: dict[str, Any] = {"technician_name": technician}
     if group:
         input_data["group_name"] = group
-    data = _request("PUT", f"/requests/{request_id}/assign", input_data=input_data)
+    data = _request("PUT", f"/requests/{request_id}/assign", input_data=input_data, form=True)
     return json.dumps(data, indent=2)
 
 
@@ -404,9 +469,59 @@ def close_request(
     if requester_ack_comments:
         closure_info["requester_ack_comments"] = requester_ack_comments
     data = _request(
-        "PUT", f"/requests/{request_id}/close", input_data={"request": {"closure_info": closure_info}}
+        "PUT",
+        f"/requests/{request_id}/close",
+        input_data={"request": {"closure_info": closure_info}},
+        form=True,
     )
     return json.dumps(data, indent=2)
+
+
+def _parse_time_spent(spec: str) -> tuple[str, str]:
+    """Accept '1:30', '1.5', '90m', '1h30m', '0:15' -> (hours, minutes)."""
+    spec = spec.strip().lower().replace("h", ":").replace("m", ":")
+    parts = [p for p in spec.replace(".", ":").split(":") if p != ""]
+    if len(parts) == 1:
+        hours, minutes = parts[0], "0"
+    elif len(parts) == 2:
+        hours, minutes = parts[0], parts[1]
+    else:
+        raise ValueError(f"Cannot parse time_spent: {spec!r} (use 'H:MM' like '1:30')")
+    return str(int(hours or 0)), str(int(minutes or 0))
+
+
+def _now_ms() -> str:
+    return str(int(time.time() * 1000))
+
+
+_own_tech_id: dict[str, str] = {}
+
+
+def _own_technician_id() -> str:
+    """Technician id this server acts as by default. Cached after first
+    lookup; configure SDP_TECH_ID (see list_technicians) or pass owner_id
+    per call."""
+    if _own_tech_id.get("id"):
+        return _own_tech_id["id"]
+    env_id = os.getenv("SDP_TECH_ID")
+    if env_id:
+        _own_tech_id["id"] = env_id
+        return env_id
+    email = os.getenv("SDP_TECH_EMAIL")
+    if email:
+        try:
+            data = _request("GET", "/technicians")
+            for t in data.get("technicians", []):
+                if t.get("email_id") == email:
+                    _own_tech_id["id"] = t["id"]
+                    return t["id"]
+        except RuntimeError:
+            pass
+    raise RuntimeError(
+        "Could not determine the default worklog owner. Set SDP_TECH_ID "
+        "(or SDP_TECH_EMAIL) in the environment, or pass owner_id "
+        "(see list_technicians)."
+    )
 
 
 @mcp.tool()
@@ -414,23 +529,81 @@ def add_note(
     request_id: str,
     description: str,
     notify_requester: bool = False,
-    time_spent: str = "",
-    work_done: str = "",
+    notify_technician: bool = False,
+    mark_first_response: bool = False,
+    add_to_linked_requests: bool = False,
 ) -> str:
-    """Add a note to a ticket. Optionally include a work log (time_spent like
-    '1:30' hours, and work_done text)."""
+    """Add a note to a ticket. Private by default; notify_requester=true makes
+    it visible to (and emails) the requester."""
     note: dict[str, Any] = {
-        "parent": {"id": request_id},
         "description": description,
-        "add_worklog": bool(time_spent or work_done),
+        "show_to_requester": notify_requester,
+        "notify_technician": notify_technician,
+        "mark_first_response": mark_first_response,
+        "add_to_linked_requests": add_to_linked_requests,
     }
-    if notify_requester:
-        note["mail_details"] = {"notify": True}
-    if time_spent:
-        note["time_spent"] = {"value": time_spent}
-    if work_done:
-        note["work_done"] = work_done
-    data = _request("POST", "/requests/notes", input_data={"note": note})
+    data = _request(
+        "POST",
+        f"/requests/{request_id}/notes",
+        input_data={"request_note": note},
+        form=True,
+    )
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def delete_note(request_id: str, note_id: str) -> str:
+    """Delete a note from a ticket."""
+    data = _request("DELETE", f"/requests/{request_id}/notes/{note_id}")
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def add_worklog(
+    request_id: str,
+    description: str,
+    time_spent: str = "0:15",
+    work_done: str = "",
+    owner_id: str = "",
+    start_time_ms: str = "",
+    end_time_ms: str = "",
+) -> str:
+    """Log work on a ticket. time_spent like '1:30' (1 hr 30 min) or '30m'.
+    work_done is the 'work performed' text appended to the description.
+    owner_id is the technician's SDP id (defaults to the technician this
+    server authenticates as — see list_technicians). start/end default to
+    now. Note: this SDP instance rejects status/is_billable keys."""
+    hours, minutes = _parse_time_spent(time_spent)
+    desc = description or work_done
+    if work_done and description:
+        desc = f"{description}\n\nWork done: {work_done}"
+    worklog: dict[str, Any] = {
+        "description": desc,
+        "start_time": {"value": start_time_ms or _now_ms()},
+        "end_time": {"value": end_time_ms or _now_ms()},
+        "time_spent": {"hours": hours, "minutes": minutes},
+        "owner": {"id": owner_id or _own_technician_id()},
+    }
+    data = _request(
+        "POST",
+        f"/requests/{request_id}/worklogs",
+        input_data={"worklog": worklog},
+        form=True,
+    )
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def list_worklogs(request_id: str) -> str:
+    """List work logs recorded on a ticket."""
+    data = _request("GET", f"/requests/{request_id}/worklogs")
+    return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+def delete_worklog(request_id: str, worklog_id: str) -> str:
+    """Delete a work log from a ticket (see list_worklogs for ids)."""
+    data = _request("DELETE", f"/requests/{request_id}/worklogs/{worklog_id}")
     return json.dumps(data, indent=2)
 
 

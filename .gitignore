@@ -11,3 +11,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# OAuth access-token cache (regenerated automatically)
+.sdp_token_cache.json
