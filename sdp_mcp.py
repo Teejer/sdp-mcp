@@ -169,7 +169,17 @@ mcp = MCPServer(
         "Tools for ManageEngine ServiceDesk Plus (Cloud Private Site). "
         "Tickets are called 'requests'. Use lookup tools (list_technicians, "
         "list_groups, list_request_filters, etc.) to resolve names to IDs "
-        "before creating or updating requests."
+        "before creating or updating requests. "
+        "Site quirks: a ticket requires a resolution before it can be closed — "
+        "set one via update_request with fields_json "
+        "{\"resolution\": {\"content\": \"...\"}} or use resolve_request; "
+        "close_request auto-applies closure_comments as the resolution if the "
+        "close is rejected for a missing one. "
+        "list_requests filters are built-in SDP filters and may include "
+        "Closed requests even when named 'Open' — always filter results by "
+        "the status field client-side. "
+        "Use list_worklogs to check logged time; the time_elapsed field on "
+        "requests is unreliable."
     ),
 )
 
@@ -209,6 +219,9 @@ def _request(
             body = {"input_data": json.dumps(input_data)}
         else:
             query["input_data"] = json.dumps(input_data)
+    elif method.upper() == "GET" and query.get("list_info"):
+        # list_info is only valid *inside* the input_data wrapper
+        query["input_data"] = json.dumps({"list_info": query.pop("list_info")})
 
     resp = httpx2.request(
         method,
@@ -219,13 +232,29 @@ def _request(
         timeout=30.0,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:2000]}")
+        body = resp.text[:2000]
+        try:
+            err = json.loads(body).get("response_status", {})
+            if err:
+                body = json.dumps(err)
+        except ValueError:
+            pass  # HTML error page (e.g. a 401 from the private-site gateway)
+        raise RuntimeError(f"HTTP {resp.status_code}: {body}")
     if not resp.content:
         return {}
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"SDP returned non-JSON (HTTP {resp.status_code}): {resp.text[:300]!r}"
+        )
     status = data.get("response_status")
-    if isinstance(status, dict) and status.get("status") == "error":
+    if isinstance(status, dict) and status.get("status") in ("error", "failed"):
         raise RuntimeError(json.dumps(status, indent=2))
+    if isinstance(status, list):
+        warnings = [m for m in status if m.get("type") == "warning"]
+        if warnings:
+            data["_warnings"] = warnings  # surface warnings to the caller
     return data
 
 
@@ -267,7 +296,9 @@ def list_requests(
 ) -> str:
     """List tickets using an SDP list filter (e.g. All_Requests,
     Open_Requests, My_Open_Requests). Use list_request_filters first to see
-    available filter names."""
+    available filter names. WARNING: filters on this site are unreliable —
+    'Open'/'My_*' filters can include Closed requests and don't truly scope
+    to the current user; filter the results by the status field."""
     list_info: dict[str, Any] = {
         "row_count": min(row_count, 100),
         "start_index": start_index,
@@ -317,9 +348,11 @@ def search_requests(
 @mcp.tool()
 def get_request(request_id: str, get_notes: bool = False) -> str:
     """Get full details of one ticket by its ID. Set get_notes=true to also
-    include its notes."""
-    params = {"get_notes": "true"} if get_notes else None
-    data = _request("GET", f"/requests/{request_id}", params=params)
+    include its notes (fetched separately — use list_worklogs for logged
+    time; the time_elapsed field on requests is unreliable)."""
+    data = _request("GET", f"/requests/{request_id}")
+    if get_notes:
+        data["notes"] = _request("GET", f"/requests/{request_id}/notes").get("notes", [])
     return json.dumps(data, indent=2)
 
 
@@ -330,7 +363,7 @@ def get_request_conversation(request_id: str, row_count: int = 50) -> str:
     data = _request(
         "GET",
         f"/requests/{request_id}/conversations",
-        params={"row_count": min(row_count, 100)},
+        params={"list_info": {"row_count": min(row_count, 100)}},
     )
     return json.dumps(data, indent=2)
 
@@ -424,11 +457,21 @@ def update_request(request_id: str, fields_json: str) -> str:
     """Update fields on a ticket. fields_json is a JSON object of request
     fields, e.g. {"subject": "...", "status": {"name": "Open"},
     "priority": {"name": "High"}, "technician": {"name": "John Doe"},
-    "group": {"name": "Service Desk"}, "description": "..."}.
-    Raw udf fields can be included as "udf_fields": {...}."""
+    "group": {"name": "Service Desk"}, "description": "...",
+    "resolution": {"content": "..."}}.
+    Raw udf fields can be included as "udf_fields": {...}.
+    Bare strings for status/priority/technician/group/urgency are accepted
+    and normalized to {"name": ...}."""
     fields = json.loads(fields_json)
     if not isinstance(fields, dict):
         raise ValueError("fields_json must be a JSON object")
+    if isinstance(fields.get("status"), dict) and "name" in fields["status"] and "id" not in fields["status"]:
+        fields["status"] = {"id": _status_id_by_name(fields["status"]["name"])}
+    elif isinstance(fields.get("status"), str):
+        fields["status"] = {"id": _status_id_by_name(fields["status"])}
+    for key in ("priority", "technician", "group", "urgency", "site"):
+        if isinstance(fields.get(key), str):
+            fields[key] = {"name": fields[key]}
     data = _request("PUT", f"/requests/{request_id}", input_data={"request": fields}, form=True)
     return json.dumps(data, indent=2)
 
@@ -450,30 +493,116 @@ def pickup_request(request_id: str) -> str:
     return json.dumps(data, indent=2)
 
 
+def _set_resolution(request_id: str, content: str) -> dict[str, Any]:
+    """Set the ticket's resolution field (required by this site before a
+    ticket can be closed)."""
+    return _request(
+        "PUT",
+        f"/requests/{request_id}",
+        input_data={"request": {"resolution": {"content": content}}},
+        form=True,
+    )
+
+
 @mcp.tool()
-def close_request(
+def resolve_request(
     request_id: str,
+    resolution: str,
+    close: bool = False,
     closure_comments: str = "",
-    closure_code: str = "Success",
-    requester_ack_resolution: bool = True,
-    requester_ack_comments: str = "",
+    closure_code: str = "",
 ) -> str:
-    """Close a ticket with optional closure comments and closure code
-    (e.g. Success, Canceled, Task not defined)."""
-    closure_info: dict[str, Any] = {
-        "closure_code": {"name": closure_code},
-        "requester_ack_resolution": requester_ack_resolution,
-    }
+    """Set a resolution on a ticket — REQUIRED before closing on this site.
+    With close=true this sets the resolution and closes in one step (the
+    recommended way to close). Log work with add_worklog first when you
+    can: without a work log SDP attaches a 'No work log found' warning to
+    the close. closure_code optional; see list_closure_codes."""
+    data = _set_resolution(request_id, resolution)
+    if close:
+        try:
+            close_data = _close_call(
+                request_id,
+                closure_comments or resolution,
+                closure_code,
+                requester_ack_resolution=False,
+                requester_ack_comments="",
+            )
+        except RuntimeError as exc:
+            _raise_if_missing_resolution(exc)
+            raise
+        data = {"resolution_update": data.get("response_status", "ok"), "close": close_data}
+    return json.dumps(data, indent=2)
+
+
+def _close_call(
+    request_id: str,
+    closure_comments: str,
+    closure_code: str,
+    requester_ack_resolution: bool,
+    requester_ack_comments: str,
+) -> dict[str, Any]:
+    closure_info: dict[str, Any] = {}
+    if closure_code:
+        closure_info["closure_code"] = {"name": closure_code}
     if closure_comments:
         closure_info["closure_comments"] = closure_comments
     if requester_ack_comments:
         closure_info["requester_ack_comments"] = requester_ack_comments
-    data = _request(
+    if requester_ack_resolution:
+        closure_info["requester_ack_resolution"] = True
+    return _request(
         "PUT",
         f"/requests/{request_id}/close",
         input_data={"request": {"closure_info": closure_info}},
         form=True,
     )
+
+
+def _raise_if_missing_resolution(exc: RuntimeError) -> None:
+    """Re-raise unless the error is the missing-resolution warning; raise a
+    clear instruction for that case."""
+    if '"resolution"' not in str(exc):
+        return
+    raise RuntimeError(
+        json.dumps(
+            {
+                "error": "SDP requires a resolution before this ticket can be "
+                "closed, and no work log was found.",
+                "fix": "Call resolve_request(request_id, resolution=<text>, "
+                "close=true) — it sets the resolution and closes in one "
+                "step. Ideally log work first with add_worklog; without a "
+                "work log SDP attaches a 'No work log found' warning.",
+            },
+            indent=2,
+        )
+    )
+
+
+@mcp.tool()
+def close_request(
+    request_id: str,
+    closure_comments: str = "",
+    closure_code: str = "",
+    requester_ack_resolution: bool = False,
+    requester_ack_comments: str = "",
+) -> str:
+    """Close a ticket. This site REQUIRES a resolution to already be set —
+    if the close fails for a missing resolution this tool raises a clear
+    error pointing at resolve_request. closure_code is optional (see
+    list_closure_codes: Success, Cancelled, Failed, Moved, Postponed,
+    Rejected, Unable to Reproduce); most tickets on this site close
+    without one."""
+    try:
+        data = _close_call(
+            request_id,
+            closure_comments,
+            closure_code,
+            requester_ack_resolution,
+            requester_ack_comments,
+        )
+    except RuntimeError as exc:
+        _raise_if_missing_resolution(exc)
+        raise
     return json.dumps(data, indent=2)
 
 
@@ -497,6 +626,25 @@ def _now_ms() -> str:
 
 
 _own_tech_id: dict[str, str] = {}
+_status_ids: Optional[dict[str, str]] = None
+
+
+def _status_id_by_name(name: str) -> str:
+    """Map a status display name to its SDP id (cached). On this site a
+    status PUT by {"name": ...} is rejected; only {"id": ...} is accepted,
+    so we resolve names against /statuses first."""
+    global _status_ids
+    if _status_ids is None:
+        data = _request("GET", "/statuses")
+        _status_ids = {
+            s.get("name", "").lower(): s.get("id", "") for s in data.get("statuses", [])
+        }
+    sid = _status_ids.get(name.lower())
+    if not sid:
+        raise ValueError(
+            f"Unknown status {name!r}. Valid: {sorted(_status_ids)}"
+        )
+    return sid
 
 
 def _own_technician_id() -> str:
@@ -637,7 +785,13 @@ def delete_worklog(request_id: str, worklog_id: str) -> str:
 def delete_request(request_id: str, permanent: bool = False) -> str:
     """Move a ticket to trash (default), or delete it permanently
     (permanent=true)."""
-    data = _request("DELETE", f"/requests/{request_id}", params={"delete_type": "permanent"} if permanent else None)
+    if permanent:
+        data = _request(
+            "PUT", f"/requests/{request_id}",
+            input_data={"request": {"is_removed": True}}, form=True,
+        )
+    else:
+        data = _request("DELETE", f"/requests/{request_id}")
     return json.dumps(data, indent=2)
 
 
@@ -656,9 +810,11 @@ def restore_request(request_id: str) -> str:
 @mcp.tool()
 def list_technicians(level: str = "", row_count: int = 50) -> str:
     """List technicians. Optionally filter by level name."""
-    params: dict[str, Any] = {"row_count": min(row_count, 200)}
+    params: dict[str, Any] = {"list_info": {"row_count": min(row_count, 200)}}
     if level:
-        params["level_name"] = level
+        params["list_info"]["search_criteria"] = [
+            {"field": "level.name", "value": level, "condition": "eq"}
+        ]
     data = _request("GET", "/technicians", params=params)
     techs = [
         {
@@ -675,7 +831,7 @@ def list_technicians(level: str = "", row_count: int = 50) -> str:
 @mcp.tool()
 def list_groups(row_count: int = 100) -> str:
     """List support groups."""
-    data = _request("GET", "/groups", params={"row_count": min(row_count, 200)})
+    data = _request("GET", "/groups", params={"list_info": {"row_count": min(row_count, 200)}})
     groups = [
         {"id": g.get("id"), "name": g.get("name"), "status": (g.get("status") or {}).get("name")}
         for g in data.get("groups", [])
@@ -694,11 +850,23 @@ def list_priorities() -> str:
 
 
 @mcp.tool()
+def list_closure_codes() -> str:
+    """List closure codes configured for requests on this site."""
+    data = _request("GET", "/closure_codes")
+    codes = [
+        {"id": c.get("id"), "name": c.get("name")}
+        for c in data.get("closure_codes", [])
+        if (c.get("module") or {}).get("name") == "request" and not c.get("inactive")
+    ]
+    return json.dumps(codes, indent=2)
+
+
+@mcp.tool()
 def list_statuses() -> str:
     """List request statuses."""
     data = _request("GET", "/statuses")
     statuses = [
-        {"id": s.get("id"), "name": s.get("name")} for s in data.get("status", [])
+        {"id": s.get("id"), "name": s.get("name")} for s in data.get("statuses", [])
     ]
     return json.dumps(statuses, indent=2)
 
@@ -707,7 +875,9 @@ def list_statuses() -> str:
 def list_request_templates(row_count: int = 100) -> str:
     """List request (incident/service request) templates."""
     data = _request(
-        "GET", "/request_templates", params={"row_count": min(row_count, 200)}
+        "GET",
+        "/request_templates",
+        params={"list_info": {"row_count": min(row_count, 200)}},
     )
     templates = [
         {
