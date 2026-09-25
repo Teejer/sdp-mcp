@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Optional
@@ -32,6 +33,7 @@ from typing import Any, Optional
 import httpx2
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
 load_dotenv()
 
@@ -184,6 +186,31 @@ mcp = MCPServer(
 )
 
 
+# Tool annotations: all four behavior hints are declared explicitly on every
+# tool so MCP hosts can warn users before invoking them. open_world_hint is
+# true for anything that talks to the external SDP API; false for tools that
+# answer purely from local data.
+def _hints(read_only: bool, destructive: bool, idempotent: bool) -> ToolAnnotations:
+    return ToolAnnotations(
+        read_only_hint=read_only,
+        destructive_hint=destructive,
+        idempotent_hint=idempotent,
+        open_world_hint=True,
+    )
+
+
+_READ_ONLY = _hints(read_only=True, destructive=False, idempotent=True)
+_CREATE = _hints(read_only=False, destructive=False, idempotent=False)
+_MUTATE = _hints(read_only=False, destructive=False, idempotent=True)
+_DELETE = _hints(read_only=False, destructive=True, idempotent=True)
+_LOCAL = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+
 def _require_config() -> None:
     has_oauth = bool(CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN)
     if not BASE_URL or not (AUTHTOKEN or has_oauth):
@@ -286,7 +313,7 @@ def _clean_request_summary(req: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_requests(
     filter_name: str = "All_Requests",
     row_count: int = 25,
@@ -316,7 +343,7 @@ def list_requests(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def search_requests(
     field: str = "subject",
     value: str = "",
@@ -345,7 +372,7 @@ def search_requests(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def get_request(request_id: str, get_notes: bool = False) -> str:
     """Get full details of one ticket by its ID. Set get_notes=true to also
     include its notes (fetched separately — use list_worklogs for logged
@@ -356,7 +383,7 @@ def get_request(request_id: str, get_notes: bool = False) -> str:
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def get_request_conversation(request_id: str, row_count: int = 50) -> str:
     """Get the conversation (comments between technician and requester) of a
     ticket."""
@@ -368,7 +395,7 @@ def get_request_conversation(request_id: str, row_count: int = 50) -> str:
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_LOCAL)
 def list_request_filters() -> str:
     """List the built-in list filters that list_requests accepts
     (filter_name values)."""
@@ -406,7 +433,7 @@ def list_request_filters() -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_CREATE)
 def create_request(
     subject: str,
     description: str = "",
@@ -452,7 +479,7 @@ def create_request(
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def update_request(request_id: str, fields_json: str) -> str:
     """Update fields on a ticket. fields_json is a JSON object of request
     fields, e.g. {"subject": "...", "status": {"name": "Open"},
@@ -476,7 +503,7 @@ def update_request(request_id: str, fields_json: str) -> str:
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def assign_request(request_id: str, technician: str, group: str = "") -> str:
     """Assign a ticket to a technician (optionally also to a group)."""
     input_data: dict[str, Any] = {"technician_name": technician}
@@ -486,7 +513,7 @@ def assign_request(request_id: str, technician: str, group: str = "") -> str:
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def pickup_request(request_id: str) -> str:
     """Pick up (take ownership of) a ticket."""
     data = _request("PUT", f"/requests/{request_id}/pickup")
@@ -504,7 +531,7 @@ def _set_resolution(request_id: str, content: str) -> dict[str, Any]:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def resolve_request(
     request_id: str,
     resolution: str,
@@ -578,7 +605,7 @@ def _raise_if_missing_resolution(exc: RuntimeError) -> None:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def close_request(
     request_id: str,
     closure_comments: str = "",
@@ -610,15 +637,25 @@ def _parse_time_spent(spec: str) -> tuple[str, str]:
     """Accept '1:30', '1.5', '90m', '1h30m', '0:15' -> (hours, minutes).
     Passed through as-is; your SDP instance records arbitrary durations
     (live worklogs include 0:01, 0:05, 0:10, 2:30...)."""
-    spec = spec.strip().lower().replace("h", ":").replace("m", ":")
-    parts = [p for p in spec.replace(".", ":").split(":") if p != ""]
-    if len(parts) == 1:
-        hours, minutes = parts[0], "0"
-    elif len(parts) == 2:
-        hours, minutes = parts[0], parts[1]
-    else:
+    s = spec.strip().lower().replace(" ", "")
+    if not s:
         raise ValueError(f"Cannot parse time_spent: {spec!r} (use 'H:MM' like '1:30')")
-    return str(int(hours or 0)), str(int(minutes or 0))
+    # Colon form: 'H:MM' (the canonical shape).
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            raise ValueError(f"Cannot parse time_spent: {spec!r} (use 'H:MM' like '1:30')")
+        return str(int(parts[0])), str(int(parts[1]))
+    # Compact '1h30m' / '30m' / '2h' form. Minutes over 59 roll into hours.
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", s)
+    if m and (m.group(1) or m.group(2)):
+        total_minutes = int(m.group(1) or 0) * 60 + int(m.group(2) or 0)
+        return str(total_minutes // 60), str(total_minutes % 60)
+    # Plain number: decimal hours ('1.5' -> 1:30) or integer hours ('2' -> 2:00).
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        total_minutes = round(float(s) * 60)
+        return str(total_minutes // 60), str(total_minutes % 60)
+    raise ValueError(f"Cannot parse time_spent: {spec!r} (use 'H:MM' like '1:30')")
 
 
 def _now_ms() -> str:
@@ -674,7 +711,7 @@ def _own_technician_id() -> str:
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_CREATE)
 def add_note(
     request_id: str,
     description: str,
@@ -701,7 +738,7 @@ def add_note(
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DELETE)
 def delete_note(request_id: str, note_id: str) -> str:
     """Delete a note from a ticket."""
     data = _request("DELETE", f"/requests/{request_id}/notes/{note_id}")
@@ -711,7 +748,7 @@ def delete_note(request_id: str, note_id: str) -> str:
 _LARGE_WORKLOG_HOURS = 10
 
 
-@mcp.tool()
+@mcp.tool(annotations=_CREATE)
 def add_worklog(
     request_id: str,
     description: str,
@@ -767,21 +804,21 @@ def add_worklog(
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_worklogs(request_id: str) -> str:
     """List work logs recorded on a ticket."""
     data = _request("GET", f"/requests/{request_id}/worklogs")
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DELETE)
 def delete_worklog(request_id: str, worklog_id: str) -> str:
     """Delete a work log from a ticket (see list_worklogs for ids)."""
     data = _request("DELETE", f"/requests/{request_id}/worklogs/{worklog_id}")
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DELETE)
 def delete_request(request_id: str, permanent: bool = False) -> str:
     """Move a ticket to trash (default), or delete it permanently
     (permanent=true)."""
@@ -795,7 +832,7 @@ def delete_request(request_id: str, permanent: bool = False) -> str:
     return json.dumps(data, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_MUTATE)
 def restore_request(request_id: str) -> str:
     """Restore a trashed ticket back to the helpdesk."""
     data = _request("PUT", f"/requests/{request_id}/restore_from_trash")
@@ -807,7 +844,7 @@ def restore_request(request_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_technicians(level: str = "", row_count: int = 50) -> str:
     """List technicians. Optionally filter by level name."""
     params: dict[str, Any] = {"list_info": {"row_count": min(row_count, 200)}}
@@ -828,7 +865,7 @@ def list_technicians(level: str = "", row_count: int = 50) -> str:
     return json.dumps(techs, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_groups(row_count: int = 100) -> str:
     """List support groups."""
     data = _request("GET", "/groups", params={"list_info": {"row_count": min(row_count, 200)}})
@@ -839,7 +876,7 @@ def list_groups(row_count: int = 100) -> str:
     return json.dumps(groups, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_priorities() -> str:
     """List priority definitions."""
     data = _request("GET", "/priorities")
@@ -849,7 +886,7 @@ def list_priorities() -> str:
     return json.dumps(priorities, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_closure_codes() -> str:
     """List closure codes configured for requests on this site."""
     data = _request("GET", "/closure_codes")
@@ -861,7 +898,7 @@ def list_closure_codes() -> str:
     return json.dumps(codes, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_statuses() -> str:
     """List request statuses."""
     data = _request("GET", "/statuses")
@@ -871,7 +908,7 @@ def list_statuses() -> str:
     return json.dumps(statuses, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_request_templates(row_count: int = 100) -> str:
     """List request (incident/service request) templates."""
     data = _request(
@@ -890,7 +927,7 @@ def list_request_templates(row_count: int = 100) -> str:
     return json.dumps(templates, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_cii_types() -> str:
     """List request types (Incident, Service Request, Problem, Change...)."""
     data = _request("GET", "/requesttypes")
@@ -900,7 +937,7 @@ def list_cii_types() -> str:
     return json.dumps(types, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 def list_requesters(search_text: str = "", row_count: int = 50) -> str:
     """List requesters. Pass search_text to search by name."""
     list_info: dict[str, Any] = {"row_count": min(row_count, 200)}

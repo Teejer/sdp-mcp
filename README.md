@@ -128,10 +128,36 @@ Or, running directly with python and passing env inline:
 | `create_request` | Create a ticket (subject required; rest optional) |
 | `update_request` | Patch arbitrary request fields via JSON |
 | `assign_request` / `pickup_request` | Assign to tech/group / take ownership |
+| `resolve_request` | Set a resolution (required before close); `close=true` closes in one step |
 | `close_request` | Close with closure code + comments |
-| `add_note` | Add a note, optional work log |
+| `add_note` / `delete_note` | Add / remove a note (private by default) |
+| `add_worklog` / `list_worklogs` / `delete_worklog` | Log, list, delete work time |
 | `delete_request` / `restore_request` | Trash / permanently delete / restore |
-| `list_technicians`, `list_groups`, `list_priorities`, `list_statuses`, `list_request_templates`, `list_cii_types`, `list_requesters` | Name/ID lookups |
+| `list_technicians`, `list_groups`, `list_priorities`, `list_statuses`, `list_closure_codes`, `list_request_templates`, `list_cii_types`, `list_requesters` | Name/ID lookups |
+
+Every tool declares the four MCP behavior annotations
+(`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) so MCP
+hosts can warn before invoking destructive operations.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+The tests replace the SDP HTTP layer with an in-memory fake, so they run
+offline with no credentials and exercise every declared tool plus its argument
+handling.
+
+## License
+
+Free for **personal and non-commercial** use (nonprofits, education, research,
+government) under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Commercial use requires a separate license from the author — open an issue to
+ask.
+
+> Required Notice: Copyright (c) 2026 Teejer
 
 ## Notes & caveats
 
