@@ -1,5 +1,7 @@
 # sdp-mcp
 
+<a href="https://m8ven.ai/mcp/teejer/sdp-mcp" rel="noopener"><img src="https://m8ven.ai/badge/mcp/teejer/sdp-mcp" alt="M8ven Score" height="20"></a>
+
 A **local** MCP (Model Context Protocol) server for ManageEngine ServiceDesk
 Plus **Cloud (On-Demand)** — e.g. `https://help.example.com` — using
 the v3 API with **Zoho OAuth 2.0** (a Self Client). Also supports a plain
